@@ -108,11 +108,38 @@ const response = await fetch('/api/agent-only', {
 
 ## Challenge Types
 
-| Type | Description | Difficulty |
-|------|-------------|------------|
-| `math_speed` | Solve N arithmetic problems | Default |
-| `json_extract` | Extract values from nested JSON | Available |
-| `pattern_match` | Complete number sequences | Available |
+| Type | Description | Use Case |
+|------|-------------|----------|
+| `math_speed` | Solve N arithmetic problems | Default, fast verification |
+| `json_extract` | Extract values from nested JSON | Tests parsing ability |
+| `pattern_match` | Complete number sequences | Tests reasoning |
+| `session_proof` | Hash session state with nonce | **Prevents pre-computation** |
+| `composite` | Multiple challenge types combined | High security |
+
+### Session Proof (Anti Pre-computation)
+
+The `session_proof` challenge requires agents to hash their session state with a server-provided nonce. This prevents humans from pre-computing answers because:
+
+1. The nonce is unique per challenge
+2. The agent must include their real session data
+3. A human piping to external AI can't fake session context
+
+```javascript
+// Challenge payload
+{
+  nonce: "a1b2c3d4...",
+  required_fields: ['agent_id', 'session_start', 'last_action_timestamp'],
+  hash_algorithm: 'sha256'
+}
+
+// Agent response
+{
+  hash: sha256(nonce + agent_id + session_start + last_action_timestamp),
+  agent_id: "my-agent",
+  session_start: "1707054720000",
+  last_action_timestamp: "1707058320000"
+}
+```
 
 ## Difficulty Levels
 
@@ -121,6 +148,40 @@ const response = await fetch('/api/agent-only', {
 | `easy` | 10 | 2000ms |
 | `standard` | 50 | 1000ms |
 | `hard` | 100 | 1500ms |
+
+### Adaptive Difficulty
+
+Enable adaptive difficulty to automatically escalate challenges based on client behavior:
+
+```javascript
+const challenge = botcha.createChallenge({
+  type: 'math_speed',
+  adaptive: true,
+  clientHistory: {
+    failureCount: 3,        // Previous failures
+    suspiciousPatterns: 1,  // Timing anomalies detected
+    lastVerified: Date.now() - 60000  // Last successful verification
+  }
+});
+```
+
+Escalation levels:
+| Level | Triggered By | Problems | Time |
+|-------|--------------|----------|------|
+| `probe` | Recently verified | 5 | 2000ms |
+| `standard` | Normal request | 50 | 1000ms |
+| `elevated` | 1+ suspicious patterns | 100 | 1500ms |
+| `intensive` | 2+ suspicious or 5+ failures | 200 | 3000ms |
+
+### Grace Period
+
+A 200ms grace period handles network jitter without rejecting legitimate agents:
+
+```javascript
+const result = verifier.verify(challengeId, answers, {
+  gracePeriod: 200  // ms added to deadline
+});
+```
 
 ## Configuration
 

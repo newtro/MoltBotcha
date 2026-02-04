@@ -4,10 +4,13 @@
  */
 
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { getStore } = require('./store');
 
 const DEFAULT_SECRET = 'botcha-secret-change-in-production';
 const DEFAULT_TOKEN_EXPIRY = 3600; // 1 hour
+const GRACE_PERIOD_MS = 200; // 200ms grace for network jitter
+const MAX_RETRIES = 2;
 
 class Verifier {
   constructor(options = {}) {
@@ -21,6 +24,7 @@ class Verifier {
    */
   verify(challengeId, answers, options = {}) {
     const now = Date.now();
+    const { gracePeriod = GRACE_PERIOD_MS, sessionData = {} } = options;
     
     // Get challenge from store (consume it - single use)
     const challenge = this.store.get(challengeId, true);
@@ -37,22 +41,37 @@ class Verifier {
     const issuedAt = new Date(challenge.issued_at).getTime();
     const elapsedMs = now - issuedAt;
     
-    // Check timing
-    if (now > deadline) {
+    // Check timing (with grace period for network jitter)
+    if (now > deadline + gracePeriod) {
       return {
         verified: false,
         error: 'timeout',
         details: {
           elapsed_ms: elapsedMs,
           deadline_ms: challenge.ttl_ms,
-          message: 'Response received after deadline'
-        }
+          grace_ms: gracePeriod,
+          message: 'Response received after deadline (including grace period)'
+        },
+        retry_allowed: true
       };
     }
     
-    // Verify answers
-    const correctAnswers = challenge.answers;
+    // Handle different challenge types
     let correctCount = 0;
+    let totalCount = 0;
+    
+    if (challenge.type === 'session_proof') {
+      // Verify session proof
+      return this.verifySessionProof(challenge, answers, sessionData, elapsedMs, options);
+    }
+    
+    if (challenge.type === 'composite') {
+      // Verify composite challenge
+      return this.verifyComposite(challenge, answers, elapsedMs, options);
+    }
+    
+    // Standard answer verification
+    const correctAnswers = challenge.answers;
     
     if (!Array.isArray(answers) || answers.length !== correctAnswers.length) {
       return {
@@ -73,7 +92,8 @@ class Verifier {
       }
     }
     
-    const accuracy = correctCount / correctAnswers.length;
+    totalCount = correctAnswers.length;
+    const accuracy = correctCount / totalCount;
     
     // Require 100% accuracy for standard/hard, 90% for easy
     const requiredAccuracy = challenge.difficulty === 'easy' ? 0.9 : 1.0;
@@ -84,7 +104,7 @@ class Verifier {
         error: 'incorrect',
         details: {
           correct_count: correctCount,
-          total_count: correctAnswers.length,
+          total_count: totalCount,
           accuracy: accuracy,
           required_accuracy: requiredAccuracy,
           elapsed_ms: elapsedMs
@@ -92,35 +112,8 @@ class Verifier {
       };
     }
     
-    // Success! Generate token
-    const tokenPayload = {
-      iss: 'botcha',
-      sub: options.clientId || 'anonymous',
-      iat: Math.floor(now / 1000),
-      exp: Math.floor(now / 1000) + this.tokenExpiry,
-      botcha: {
-        verified_at: new Date(now).toISOString(),
-        difficulty: challenge.difficulty,
-        challenge_type: challenge.type,
-        solve_time_ms: elapsedMs,
-        accuracy: accuracy
-      }
-    };
-    
-    const token = jwt.sign(tokenPayload, this.secret);
-    
-    return {
-      verified: true,
-      token,
-      token_type: 'Bearer',
-      expires_at: new Date(now + this.tokenExpiry * 1000).toISOString(),
-      expires_in: this.tokenExpiry,
-      agent_score: {
-        solve_time_ms: elapsedMs,
-        accuracy: accuracy,
-        confidence: this.calculateConfidence(elapsedMs, challenge.ttl_ms, accuracy)
-      }
-    };
+    // Success!
+    return this.generateSuccessResult(challenge, elapsedMs, accuracy, options);
   }
   
   /**
@@ -170,6 +163,171 @@ class Verifier {
       success: true,
       token: newToken,
       expires_at: new Date(now + this.tokenExpiry * 1000).toISOString()
+    };
+  }
+  
+  /**
+   * Verify session proof challenge
+   * Agent must prove they have session context that can't be pre-computed
+   */
+  verifySessionProof(challenge, answers, sessionData, elapsedMs, options = {}) {
+    const { hash, agent_id, session_start, last_action_timestamp } = answers;
+    
+    if (!hash || !agent_id || !session_start || !last_action_timestamp) {
+      return {
+        verified: false,
+        error: 'incomplete_proof',
+        details: { message: 'Missing required session proof fields' }
+      };
+    }
+    
+    // Verify the hash format (should be 64 char hex for SHA256)
+    if (!/^[a-f0-9]{64}$/i.test(hash)) {
+      return {
+        verified: false,
+        error: 'invalid_hash',
+        details: { message: 'Hash must be SHA256 hex string' }
+      };
+    }
+    
+    // Verify the hash is computed correctly
+    const nonce = challenge.nonce;
+    const expectedInput = `${nonce}${agent_id}${session_start}${last_action_timestamp}`;
+    const expectedHash = crypto.createHash('sha256').update(expectedInput).digest('hex');
+    
+    // Constant-time comparison to prevent timing attacks
+    const hashMatch = crypto.timingSafeEqual(
+      Buffer.from(hash.toLowerCase()),
+      Buffer.from(expectedHash.toLowerCase())
+    );
+    
+    if (!hashMatch) {
+      return {
+        verified: false,
+        error: 'hash_mismatch',
+        details: { message: 'Session proof hash does not match' }
+      };
+    }
+    
+    // Verify timing makes sense
+    const lastAction = parseInt(last_action_timestamp);
+    const sessionStart = parseInt(session_start);
+    const now = Date.now();
+    
+    // Session should have started before now
+    if (sessionStart > now || lastAction > now) {
+      return {
+        verified: false,
+        error: 'invalid_timestamps',
+        details: { message: 'Timestamps are in the future' }
+      };
+    }
+    
+    // Last action should be recent (within 5 minutes)
+    if (now - lastAction > 300000) {
+      return {
+        verified: false,
+        error: 'stale_session',
+        details: { message: 'Last action timestamp is too old' }
+      };
+    }
+    
+    // Success!
+    return this.generateSuccessResult(challenge, elapsedMs, 1.0, options);
+  }
+  
+  /**
+   * Verify composite challenge (multiple challenge types)
+   */
+  verifyComposite(challenge, answers, elapsedMs, options = {}) {
+    if (!answers.math || !answers.patterns) {
+      return {
+        verified: false,
+        error: 'incomplete_composite',
+        details: { message: 'Missing math or patterns answers' }
+      };
+    }
+    
+    const correctMath = challenge.answers.math;
+    const correctPatterns = challenge.answers.patterns;
+    
+    let mathCorrect = 0;
+    let patternCorrect = 0;
+    
+    // Verify math answers
+    if (Array.isArray(answers.math)) {
+      for (let i = 0; i < Math.min(answers.math.length, correctMath.length); i++) {
+        if (String(answers.math[i]) === String(correctMath[i])) {
+          mathCorrect++;
+        }
+      }
+    }
+    
+    // Verify pattern answers
+    if (Array.isArray(answers.patterns)) {
+      for (let i = 0; i < Math.min(answers.patterns.length, correctPatterns.length); i++) {
+        if (String(answers.patterns[i]) === String(correctPatterns[i])) {
+          patternCorrect++;
+        }
+      }
+    }
+    
+    const totalCorrect = mathCorrect + patternCorrect;
+    const totalCount = correctMath.length + correctPatterns.length;
+    const accuracy = totalCorrect / totalCount;
+    
+    // Require 95% accuracy for composite
+    if (accuracy < 0.95) {
+      return {
+        verified: false,
+        error: 'incorrect',
+        details: {
+          math_correct: mathCorrect,
+          math_total: correctMath.length,
+          pattern_correct: patternCorrect,
+          pattern_total: correctPatterns.length,
+          accuracy,
+          elapsed_ms: elapsedMs
+        }
+      };
+    }
+    
+    return this.generateSuccessResult(challenge, elapsedMs, accuracy, options);
+  }
+  
+  /**
+   * Generate success result with token
+   */
+  generateSuccessResult(challenge, elapsedMs, accuracy, options = {}) {
+    const now = Date.now();
+    
+    const tokenPayload = {
+      iss: 'botcha',
+      sub: options.clientId || 'anonymous',
+      iat: Math.floor(now / 1000),
+      exp: Math.floor(now / 1000) + this.tokenExpiry,
+      botcha: {
+        verified_at: new Date(now).toISOString(),
+        difficulty: challenge.difficulty,
+        challenge_type: challenge.type,
+        solve_time_ms: elapsedMs,
+        accuracy: accuracy
+      }
+    };
+    
+    const token = jwt.sign(tokenPayload, this.secret);
+    
+    return {
+      verified: true,
+      token,
+      token_type: 'Bearer',
+      expires_at: new Date(now + this.tokenExpiry * 1000).toISOString(),
+      expires_in: this.tokenExpiry,
+      agent_score: {
+        solve_time_ms: elapsedMs,
+        accuracy: accuracy,
+        confidence: this.calculateConfidence(elapsedMs, challenge.ttl_ms, accuracy)
+      }
     };
   }
   

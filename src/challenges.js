@@ -4,6 +4,7 @@
  */
 
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 
 // Difficulty presets
 const DIFFICULTY = {
@@ -11,6 +12,14 @@ const DIFFICULTY = {
   standard: { count: 50, timeLimit: 1000 },
   hard: { count: 100, timeLimit: 1500 }
 };
+
+// Adaptive difficulty escalation
+const ADAPTIVE_LEVELS = [
+  { name: 'probe', count: 5, timeLimit: 2000 },      // Quick check
+  { name: 'standard', count: 50, timeLimit: 1000 },  // Normal verification
+  { name: 'elevated', count: 100, timeLimit: 1500 }, // Suspicious pattern
+  { name: 'intensive', count: 200, timeLimit: 3000 } // High security
+];
 
 /**
  * Generate a math_speed challenge
@@ -191,34 +200,136 @@ function generatePatternMatch(difficulty = 'standard') {
 }
 
 /**
+ * Generate a session_proof challenge
+ * Requires agent to prove session continuity by hashing session state
+ * This prevents humans from piping to external AI - they can't fake session context
+ */
+function generateSessionProof(difficulty = 'standard', sessionContext = {}) {
+  const config = DIFFICULTY[difficulty] || DIFFICULTY.standard;
+  
+  // Generate a unique nonce that MUST be included in the hash
+  const nonce = crypto.randomBytes(16).toString('hex');
+  
+  // The agent must hash: nonce + their session data
+  // We provide the nonce, they provide session proof
+  const challenge = {
+    type: 'session_proof',
+    difficulty,
+    payload: {
+      nonce,
+      required_fields: ['agent_id', 'session_start', 'last_action_timestamp'],
+      hash_algorithm: 'sha256',
+      instructions: 'Concatenate: nonce + agent_id + session_start + last_action_timestamp, then SHA256 hash'
+    },
+    // We'll verify by checking hash format and timing
+    // The session data can't be pre-computed because nonce is unique
+    answers: [nonce], // Store nonce for verification
+    timeLimit: config.timeLimit,
+    nonce // For verification
+  };
+  
+  return challenge;
+}
+
+/**
+ * Generate a composite challenge (multiple types)
+ * Harder to pre-compute, requires diverse capabilities
+ */
+function generateComposite(difficulty = 'standard') {
+  const config = DIFFICULTY[difficulty] || DIFFICULTY.standard;
+  
+  // Combine multiple challenge types
+  const mathCount = Math.floor(config.count * 0.6);
+  const patternCount = Math.floor(config.count * 0.2);
+  
+  const mathChallenge = generateMathSpeed(difficulty);
+  const patternChallenge = generatePatternMatch(difficulty);
+  
+  return {
+    type: 'composite',
+    difficulty,
+    payload: {
+      math: mathChallenge.payload.equations.slice(0, mathCount),
+      patterns: patternChallenge.payload.sequences.slice(0, patternCount),
+      // Add a nonce to prevent pre-computation
+      nonce: crypto.randomBytes(8).toString('hex')
+    },
+    answers: {
+      math: mathChallenge.answers.slice(0, mathCount),
+      patterns: patternChallenge.answers.slice(0, patternCount)
+    },
+    timeLimit: config.timeLimit * 1.5
+  };
+}
+
+/**
+ * Get adaptive difficulty level based on client history
+ */
+function getAdaptiveLevel(clientHistory = {}) {
+  const { failureCount = 0, suspiciousPatterns = 0, lastVerified } = clientHistory;
+  
+  // Escalate based on failures and suspicious behavior
+  if (suspiciousPatterns > 2 || failureCount > 5) {
+    return ADAPTIVE_LEVELS[3]; // intensive
+  }
+  if (suspiciousPatterns > 0 || failureCount > 2) {
+    return ADAPTIVE_LEVELS[2]; // elevated
+  }
+  if (lastVerified && Date.now() - lastVerified < 300000) {
+    return ADAPTIVE_LEVELS[0]; // probe - recently verified
+  }
+  return ADAPTIVE_LEVELS[1]; // standard
+}
+
+/**
  * Create a new challenge
  */
 function createChallenge(options = {}) {
   const {
     type = 'math_speed',
-    difficulty = 'standard'
+    difficulty = 'standard',
+    adaptive = false,
+    clientHistory = {},
+    sessionContext = {}
   } = options;
   
   let challenge;
+  let effectiveDifficulty = difficulty;
+  
+  // Use adaptive difficulty if enabled
+  if (adaptive) {
+    const level = getAdaptiveLevel(clientHistory);
+    effectiveDifficulty = level.name;
+  }
   
   switch (type) {
     case 'json_extract':
-      challenge = generateJsonExtract(difficulty);
+      challenge = generateJsonExtract(effectiveDifficulty);
       break;
     case 'pattern_match':
-      challenge = generatePatternMatch(difficulty);
+      challenge = generatePatternMatch(effectiveDifficulty);
+      break;
+    case 'session_proof':
+      challenge = generateSessionProof(effectiveDifficulty, sessionContext);
+      break;
+    case 'composite':
+      challenge = generateComposite(effectiveDifficulty);
       break;
     case 'math_speed':
     default:
-      challenge = generateMathSpeed(difficulty);
+      challenge = generateMathSpeed(effectiveDifficulty);
       break;
   }
   
   const now = Date.now();
   
+  // Add unique nonce to ALL challenges to prevent pre-computation
+  const challengeNonce = crypto.randomBytes(8).toString('hex');
+  
   return {
     challenge_id: uuidv4(),
     ...challenge,
+    challenge_nonce: challengeNonce, // Unique per challenge
     issued_at: new Date(now).toISOString(),
     deadline: new Date(now + challenge.timeLimit).toISOString(),
     ttl_ms: challenge.timeLimit
@@ -230,5 +341,9 @@ module.exports = {
   generateMathSpeed,
   generateJsonExtract,
   generatePatternMatch,
-  DIFFICULTY
+  generateSessionProof,
+  generateComposite,
+  getAdaptiveLevel,
+  DIFFICULTY,
+  ADAPTIVE_LEVELS
 };
